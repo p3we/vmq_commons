@@ -601,9 +601,9 @@ erase(K,D) ->
 '++'(N) -> N + 1.
 
 active_once(gen_tcp, Sock) ->
-    ok = inet:setopts(Sock, [{active, once}]);
+    inet:setopts(Sock, [{active, once}]);
 active_once(ssl, Sock) ->
-    ok = ssl:setopts(Sock, [{active, once}]).
+    ssl:setopts(Sock, [{active, once}]).
 
 call_info_fun(Info, {Fun, FunState}) ->
     {Fun, Fun(Info, FunState)}.
