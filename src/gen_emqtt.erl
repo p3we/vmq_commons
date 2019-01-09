@@ -191,13 +191,14 @@ connecting(_Event, State) ->
 waiting_for_connack(_Event, State) ->
     {next_state, waiting_for_connack, State}.
 
-disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout, transport={Transport,_}} = State) ->
+disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout, transport={Transport,_}, client=ClientId, info_fun=InfoFun} = State) ->
     Transport:close(Sock),
-    error_logger:error_msg("bridge disconnected due to connection error ~p", [ConnectError]),
+    error_logger:warning_msg("disconnected due to connection error ~p", [ConnectError]),
     case ConnectError of
         {connect_error, ?CONNACK_SERVER} when Timeout /= undefined ->
             gen_fsm:send_event_after(Timeout, connect),
-            {next_state, connecting, State#state{sock=nil}};
+            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
+            {next_state, connecting, State#state{sock=nil, info_fun=NewInfoFun}};
         _ ->
             {stop, ConnectError, State}
     end.
