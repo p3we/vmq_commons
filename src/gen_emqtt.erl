@@ -272,7 +272,7 @@ connected(ping, #state{transport={Transport, _}, sock=Sock,
 
 connected(disconnect, State=#state{transport={Transport, _}, sock=Sock}) ->
     send_disconnect(Transport, Sock),
-    {stop, normal, State};
+    wrap_res(connecting, on_close, [], State#state{sock=undefined});
 
 connected(maybe_reconnect, #state{client=ClientId, reconnect_timeout=Timeout, transport={Transport, _}, info_fun=InfoFun} = State) ->
     case Timeout of
