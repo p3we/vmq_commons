@@ -186,9 +186,11 @@ connecting(connect, State) ->
 connecting(disconnect, State) ->
     {stop,  normal, State};
 connecting(_Event, State) ->
+    error_logger:warning_msg("received unexpected event in connecting state"),
     {next_state, connecting, State}.
 
 waiting_for_connack(_Event, State) ->
+    error_logger:warning_msg("received unexpected event in waiting_for_connack state"),
     {next_state, waiting_for_connack, State}.
 
 disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout, transport={Transport,_}, client=ClientId, info_fun=InfoFun} = State) ->
@@ -201,7 +203,9 @@ disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout
             {next_state, connecting, State#state{sock=nil, info_fun=NewInfoFun}};
         _ ->
             {stop, ConnectError, State}
-    end.
+    end;
+disconnecting(_Event, State) ->
+    {stop, unknown_event, State}.
 
 connected({subscribe, Topics}, State=#state{transport={Transport,_}, msgid=MsgId,
     sock=Sock, waiting_acks=WAcks,
@@ -515,7 +519,11 @@ handle_frame(connected, #mqtt_pingresp{}, State) ->
 
 handle_frame(connected, #mqtt_disconnect{}, State) ->
     gen_fsm:send_event_after(5000, connect),
-    wrap_res(connecting, on_disconnect, [], State).
+    wrap_res(connecting, on_disconnect, [], State);
+
+handle_frame(StateName, _Packet, State) ->
+    error_logger:warning_msg("received unexpected packet in ~p state", [StateName]),
+    {next_state, StateName, State}.
 
 handle_event(Event, StateName, State) ->
     wrap_res(StateName, handle_cast, [Event], State).
