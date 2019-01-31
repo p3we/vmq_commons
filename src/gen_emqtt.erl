@@ -208,8 +208,10 @@ disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout
         _ ->
             {stop, ConnectError, State}
     end;
-disconnecting(_Event, State) ->
-    {stop, unknown_event, State}.
+disconnecting(Event, #state{retry_interval=RetryInterval} = State) ->
+    error_logger:warning_msg("rescheduling unexpected event received in disconnecting state"),
+    gen_fsm:send_event_after(RetryInterval, Event),
+    {next_state, disconnecting, State}.
 
 connected({subscribe, Topics}, State=#state{transport={Transport,_}, msgid=MsgId,
     sock=Sock, waiting_acks=WAcks,
@@ -293,8 +295,9 @@ connected(maybe_reconnect, #state{client=ClientId, reconnect_timeout=Timeout, tr
             wrap_res(connecting, on_disconnect, [], State#state{sock=undefined, info_fun=NewInfoFun})
     end;
 
-connected(_Event, State) ->
-    {stop, unknown_event, State}.
+connected(Event, State) ->
+    error_logger:warning_msg("received unexpected ~p event in connected state", [Event]),
+    {next_state, connected, State}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% gen_fsm callbacks
