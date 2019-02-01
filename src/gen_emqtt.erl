@@ -62,7 +62,9 @@
     last_will_msg           :: string() | undefined,
     last_will_qos           :: non_neg_integer(),
     buffer = <<>>           :: binary(),
+    reconnect_limit,
     reconnect_timeout,
+    reconnect_counter = 0,
     keepalive_interval = 60000,
     retry_interval = 10000,
     proto_version = ?MQTT_PROTO_MAJOR,
@@ -185,6 +187,8 @@ connecting(connect, State) ->
     end;
 connecting(disconnect, State) ->
     wrap_res(connecting, on_disconnect, [], State);
+connecting(maybe_reconnect, State) ->
+    {next_state, connecting, State};
 connecting(Event, #state{retry_interval=RetryInterval} = State) ->
     error_logger:warning_msg("rescheduling unexpected event received in connecting state"),
     gen_fsm:send_event_after(RetryInterval, Event),
@@ -192,19 +196,26 @@ connecting(Event, #state{retry_interval=RetryInterval} = State) ->
 
 waiting_for_connack(disconnect, State) ->
     wrap_res(connecting, on_disconnect, [], State);
+waiting_for_connack(maybe_reconnect, State) ->
+    {next_state, waiting_for_connack, State};
 waiting_for_connack(Event, #state{retry_interval=RetryInterval} = State) ->
     error_logger:warning_msg("rescheduling unexpected event received in waiting_for_connack state"),
     gen_fsm:send_event_after(RetryInterval, Event),
     {next_state, waiting_for_connack, State}.
 
-disconnecting({error, ConnectError}, #state{sock=Sock, reconnect_timeout=Timeout, transport={Transport,_}, client=ClientId, info_fun=InfoFun} = State) ->
+disconnecting({error, ConnectError}, #state{sock=Sock, transport={Transport,_}, client=ClientId, info_fun=InfoFun} = State) ->
     Transport:close(Sock),
     error_logger:warning_msg("disconnected due to connection error ~p", [ConnectError]),
     case ConnectError of
-        {connect_error, ?CONNACK_SERVER} when Timeout /= undefined ->
-            gen_fsm:send_event_after(Timeout, connect),
-            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
-            {next_state, connecting, State#state{sock=nil, info_fun=NewInfoFun}};
+        {connect_error, ?CONNACK_SERVER} ->
+            case backoff(State) of
+                {ok, NewState, Timeout} ->
+                    gen_fsm:send_event_after(Timeout, connect),
+                    NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
+                    wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
+                {stop, _} ->
+                    {stop, ConnectError, State}
+            end;
         _ ->
             {stop, ConnectError, State}
     end;
@@ -284,15 +295,15 @@ connected(disconnect, State=#state{transport={Transport, _}, sock=Sock}) ->
     send_disconnect(Transport, Sock),
     wrap_res(connecting, on_close, [], State#state{sock=undefined});
 
-connected(maybe_reconnect, #state{client=ClientId, reconnect_timeout=Timeout, transport={Transport, _}, info_fun=InfoFun} = State) ->
-    case Timeout of
-        undefined ->
-            wrap_res(connecting, on_close, [], State#state{sock=undefined});
-        _ ->
-            Transport:close(State#state.sock),
+connected(maybe_reconnect, #state{sock=Sock, client=ClientId, transport={Transport, _}, info_fun=InfoFun} = State) ->
+    case backoff(State) of
+        {ok, NewState, Timeout} ->
+            Transport:close(Sock),
             gen_fsm:send_event_after(Timeout, connect),
             NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
-            wrap_res(connecting, on_disconnect, [], State#state{sock=undefined, info_fun=NewInfoFun})
+            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
+        {stop, _} ->
+            wrap_res(connecting, on_close, [], State#state{sock=undefined})
     end;
 
 connected(Event, State) ->
@@ -313,6 +324,7 @@ init([Mod, Args, Opts]) ->
     LWMsg = proplists:get_value(last_will_msg, Opts, undefined),
     LWQos = proplists:get_value(last_will_qos, Opts, 0),
     ReconnectTimeout = proplists:get_value(reconnect_timeout, Opts, undefined),
+    ReconnectLimit = proplists:get_value(reconnect_limit, Opts, 5),
     KeepAliveInterval = proplists:get_value(keepalive_interval, Opts, 60),
     RetryInterval = proplists:get_value(retry_interval, Opts, 10),
     ProtoVer = proplists:get_value(proto_version, Opts, ?MQTT_PROTO_MAJOR),
@@ -324,6 +336,7 @@ init([Mod, Args, Opts]) ->
         username = Username, password = Password, client=ClientId, mod=Mod,
         clean_session=CleanSession, last_will_topic=LWTopic, last_will_msg=LWMsg, last_will_qos=LWQos,
         reconnect_timeout=case ReconnectTimeout of undefined -> undefined; _ -> 1000 * ReconnectTimeout end,
+        reconnect_limit=ReconnectLimit,
         keepalive_interval=1000 * KeepAliveInterval,
         retry_interval=1000* RetryInterval, transport={Transport, TransportOpts},
         info_fun=InfoFun},
@@ -342,17 +355,24 @@ handle_info({tcp, Socket, Bin}, StateName, #state{sock=Socket} = State) ->
     process_bytes(<<Buffer/binary, Bin/binary>>, StateName, State);
 
 
-handle_info({ssl_closed, Sock}, _, State=#state{sock=Sock, reconnect_timeout=undefined}) ->
-    wrap_res(connecting, on_close, [], State#state{sock=undefined});
-handle_info({ssl_closed, Sock}, _, State=#state{sock=Sock, reconnect_timeout=Timeout}) ->
-    gen_fsm:send_event_after(Timeout, connect),
-    wrap_res(connecting, on_disconnect, [], State#state{sock=undefined});
-handle_info({tcp_closed, Sock}, _, State=#state{sock=Sock, reconnect_timeout=undefined}) ->
-    wrap_res(connecting, on_close, [], State#state{sock=undefined});
-handle_info({tcp_closed, Sock}, _, State=#state{sock=Sock, reconnect_timeout=Timeout}) ->
-    gen_fsm:send_event_after(Timeout, connect),
-    wrap_res(connecting, on_disconnect, [], State#state{sock=undefined});
-
+handle_info({ssl_closed, Sock}, _, State=#state{sock=Sock, client=ClientId, info_fun=InfoFun}) ->
+    case backoff(State) of
+        {ok, NewState, Timeout} ->
+            gen_fsm:send_event_after(Timeout, connect),
+            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
+            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
+        {stop, _} ->
+            wrap_res(connecting, on_close, [], State#state{sock=undefined})
+    end;
+handle_info({tcp_closed, Sock}, _, State=#state{sock=Sock, client=ClientId, info_fun=InfoFun}) ->
+    case backoff(State) of
+        {ok, NewState, Timeout} ->
+            gen_fsm:send_event_after(Timeout, connect),
+            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
+            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
+        {stop, _} ->
+            wrap_res(connecting, on_close, [], State#state{sock=undefined})
+    end;
 handle_info(Info, StateName, State) ->
     wrap_res(StateName, handle_info, [Info], State).
 
@@ -374,11 +394,11 @@ handle_frame(waiting_for_connack, #mqtt_connack{return_code=ReturnCode}, State) 
     case ReturnCode of
         ?CONNACK_ACCEPT when Int == 0 ->
             NewInfoFun = call_info_fun({connack_in, ClientId}, InfoFun),
-            wrap_res(connected, on_connect, [], State#state{info_fun=NewInfoFun});
+            wrap_res(connected, on_connect, [], State#state{reconnect_counter=0, info_fun=NewInfoFun});
         ?CONNACK_ACCEPT ->
             NewInfoFun = call_info_fun({connack_in, ClientId}, InfoFun),
             Ref = gen_fsm:send_event_after(Int, ping),
-            wrap_res(connected, on_connect, [], State#state{waiting_acks=store(ping, Ref, WAcks), info_fun=NewInfoFun});
+            wrap_res(connected, on_connect, [], State#state{reconnect_counter=0, waiting_acks=store(ping, Ref, WAcks), info_fun=NewInfoFun});
         ?CONNACK_PROTO_VER ->
             gen_fsm:send_event_after(0, {error, {connect_error, ?CONNACK_PROTO_VER}}),
             wrap_res(disconnecting, on_connect_error, [wrong_protocol_version], State);
@@ -612,6 +632,13 @@ send_frame(Transport, Sock, Frame) ->
             gen_fsm:send_event(self(), maybe_reconnect)
     end.
 
+
+backoff(#state{reconnect_timeout=undefined} = State) ->
+    {stop, State};
+backoff(#state{reconnect_limit=Limit, reconnect_counter=Limit} = State) ->
+    {stop, State};
+backoff(#state{reconnect_timeout=Timeout, reconnect_counter=Counter} = State) ->
+    {ok, State#state{reconnect_counter=Counter+1}, round(Timeout * math:pow(2, Counter))}.
 
 store(K,V,D) ->
     dict:store(K,V,D).
