@@ -295,16 +295,9 @@ connected(disconnect, State=#state{transport={Transport, _}, sock=Sock}) ->
     send_disconnect(Transport, Sock),
     wrap_res(connecting, on_close, [], State#state{sock=undefined});
 
-connected(maybe_reconnect, #state{sock=Sock, client=ClientId, transport={Transport, _}, info_fun=InfoFun} = State) ->
-    case backoff(State) of
-        {ok, NewState, Timeout} ->
-            Transport:close(Sock),
-            gen_fsm:send_event_after(Timeout, connect),
-            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
-            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
-        {stop, _} ->
-            wrap_res(connecting, on_close, [], State#state{sock=undefined})
-    end;
+connected(maybe_reconnect, #state{sock=Sock, transport={Transport, _}} = State) ->
+    Transport:close(Sock),
+    maybe_reconnect(State);
 
 connected(Event, State) ->
     error_logger:warning_msg("received unexpected ~p event in connected state", [Event]),
@@ -353,26 +346,16 @@ handle_info({tcp, Socket, Bin}, StateName, #state{sock=Socket} = State) ->
     #state{transport={Transport, _}, buffer=Buffer} = State,
     active_once(Transport, Socket),
     process_bytes(<<Buffer/binary, Bin/binary>>, StateName, State);
+handle_info({gun_ws, Socket, _StreamRef, {binary, Bin}}, StateName, #state{sock=Socket, buffer=Buffer} = State) ->
+    process_bytes(<<Buffer/binary, Bin/binary>>, StateName, State);
 
 
-handle_info({ssl_closed, Sock}, _, State=#state{sock=Sock, client=ClientId, info_fun=InfoFun}) ->
-    case backoff(State) of
-        {ok, NewState, Timeout} ->
-            gen_fsm:send_event_after(Timeout, connect),
-            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
-            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
-        {stop, _} ->
-            wrap_res(connecting, on_close, [], State#state{sock=undefined})
-    end;
-handle_info({tcp_closed, Sock}, _, State=#state{sock=Sock, client=ClientId, info_fun=InfoFun}) ->
-    case backoff(State) of
-        {ok, NewState, Timeout} ->
-            gen_fsm:send_event_after(Timeout, connect),
-            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
-            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
-        {stop, _} ->
-            wrap_res(connecting, on_close, [], State#state{sock=undefined})
-    end;
+handle_info({ssl_closed, Sock}, _, State=#state{sock=Sock}) ->
+    maybe_reconnect(State);
+handle_info({tcp_closed, Sock}, _, State=#state{sock=Sock}) ->
+    maybe_reconnect(State);
+handle_info({gun_down, Sock, _Protocol, _Reason, _Killed, _Unprocessed}, _, #state{sock=Sock} = State) ->
+    maybe_reconnect(State);
 handle_info(Info, StateName, State) ->
     wrap_res(StateName, handle_info, [Info], State).
 
@@ -632,6 +615,15 @@ send_frame(Transport, Sock, Frame) ->
             gen_fsm:send_event(self(), maybe_reconnect)
     end.
 
+maybe_reconnect(#state{client=ClientId, info_fun=InfoFun} = State) ->
+    case backoff(State) of
+        {ok, NewState, Timeout} ->
+            gen_fsm:send_event_after(Timeout, connect),
+            NewInfoFun = call_info_fun({reconnect, ClientId}, InfoFun),
+            wrap_res(connecting, on_disconnect, [], NewState#state{sock=undefined, info_fun=NewInfoFun});
+        {stop, _} ->
+            wrap_res(connecting, on_close, [], State#state{sock=undefined})
+    end.
 
 backoff(#state{reconnect_timeout=undefined} = State) ->
     {stop, State};
@@ -652,7 +644,9 @@ erase(K,D) ->
 active_once(gen_tcp, Sock) ->
     inet:setopts(Sock, [{active, once}]);
 active_once(ssl, Sock) ->
-    ssl:setopts(Sock, [{active, once}]).
+    ssl:setopts(Sock, [{active, once}]);
+active_once(websocket, _Sock) ->
+    ok.
 
 call_info_fun(Info, {Fun, FunState}) ->
     {Fun, Fun(Info, FunState)}.
